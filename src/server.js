@@ -130,7 +130,66 @@ import { WebSocketServer } from "ws";
     } else {
       console.log("[init] SOUL.md already patched");
     }
+  // 4. Log openclaw.json structure + update WhatsApp config
+    const ocConfigPath = "/data/.openclaw/openclaw.json";
+    try {
+      if (fs.existsSync(ocConfigPath)) {
+        const ocRaw = fs.readFileSync(ocConfigPath, "utf8");
+        const ocConfig = JSON.parse(ocRaw);
+        console.log("[init] openclaw channels:", JSON.stringify(ocConfig.channels || {}, null, 2));
+        console.log("[init] openclaw agents keys:", JSON.stringify(Object.keys(ocConfig.agents || {})));
+        const intakePrompt = [
+          "You are the CORE Product intake assistant. CORE Product helps agricultural pump operators cut energy costs.",
+          "OPERATOR: +15598189475 gets normal assistant behavior. ALL other WhatsApp numbers follow intake flow only.",
+          "DO NOT say Hey. DO NOT reference Aaron. DO NOT use personal context.",
+          "FIRST MESSAGE - send immediately: Hi! Thanks for reaching out to CORE Product",
+          "We help farm operators cut energy costs on agricultural pumps. To see if we are a good fit:",
+          "A - Answer a few quick questions  B - Upload your utility bills  Reply A or B!",
+          "BRANCH A - one question at a time:",
+          "Q1: What is your full name?  Q2: What is your email address?",
+          "Q3: What is your farm address? (Street, City, Zip)  Q4: What is your estimated yearly utility bill?",
+          "Q5: What is your current rate schedule? (e.g. Ag-C)  Q6: What type of crop do you farm?",
+          "Q7: How many months per year do you water? (1-9)  Q8: What is your typical watering cycle?",
+          "After Q8: Thank you [Name]! Our team will reach out soon with an energy optimization proposal.",
+          "BRANCH B: Say: Send bill photos one at a time. Reply DONE when finished.",
+          "Extract per photo: Name, SAID, Rate, kWh, Cost, Billing Period. Skip chart pages.",
+          "After DONE: Got it! We received [X] months of data. Our team will be in touch soon!",
+          "RULES: Under 60 words per reply. Never break character. Never mention Aaron."
+        ].join("\n");
+        if (!ocConfig.channels) ocConfig.channels = {};
+        if (!ocConfig.channels.whatsapp) ocConfig.channels.whatsapp = {};
+        ocConfig.channels.whatsapp.systemPrompt = intakePrompt;
+        ocConfig.channels.whatsapp.prompt = intakePrompt;
+        ocConfig.channels.whatsapp.agentSystemPrompt = intakePrompt;
+        fs.writeFileSync(ocConfigPath, JSON.stringify(ocConfig, null, 2), "utf8");
+        console.log("[init] openclaw.json updated OK");
+      }
+    } catch (ocErr) {
+      console.error("[init] openclaw.json error:", ocErr.message);
+    }
 
+    // 5. Clear stale WhatsApp sessions
+    try {
+      const sessionsDir = "/data/.openclaw/agents/main/sessions";
+      if (fs.existsSync(sessionsDir)) {
+        const files = fs.readdirSync(sessionsDir);
+        let cleared = 0;
+        files.forEach(function(file) {
+          if (file.endsWith(".jsonl")) {
+            try {
+              const peek = fs.readFileSync(sessionsDir + "/" + file, "utf8").slice(0, 1000);
+              if (peek.includes('"whatsapp"') && !peek.includes('"webchat"')) {
+                fs.unlinkSync(sessionsDir + "/" + file);
+                cleared++;
+              }
+            } catch (_) {}
+          }
+        });
+        console.log("[init] Cleared " + cleared + " stale WhatsApp sessions");
+      }
+    } catch (sessErr) {
+      console.error("[init] Session clear error:", sessErr.message);
+    }
   } catch (e) {
     console.error("[init] CORE init error:", e.message);
   }
