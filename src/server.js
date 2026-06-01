@@ -8,7 +8,6 @@ import express from "express";
 import httpProxy from "http-proxy";
 import pty from "node-pty";
 import { WebSocketServer } from "ws";
-
 // ── CORE Product intake init ─────────────────────────────────────────────────
 (function initCoreProduct() {
   try {
@@ -154,7 +153,350 @@ import { WebSocketServer } from "ws";
   }
 })();
 // ── end CORE Product intake init ─────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+// CORE PRODUCT — STATELESS WHATSAPP INTAKE
+// Handles all farmer inbound messages via Twilio webhook.
+// Zero OpenClaw sessions created. State lives in Airtable.
+// AI (Claude) called only for bill image OCR.
+// Webhook URL: POST /hooks/whatsapp/intake
+// ══════════════════════════════════════════════════════════════════════════════
 
+const INTAKE_CFG = {
+  accountSid:      process.env.TWILIO_ACCOUNT_SID      || "",
+  authToken:       process.env.TWILIO_AUTH_TOKEN        || "",
+  fromNumber:      process.env.TWILIO_WHATSAPP_NUMBER   || "",
+  airtableKey:     process.env.AIRTABLE_API_KEY         || "",
+  airtableBase:    process.env.AIRTABLE_BASE_ID         || "",
+  sessionsTable:   "Intake_Sessions",
+  leadsTable:      "Farmer_Leads",
+  anthropicKey:    process.env.ANTHROPIC_API_KEY        || "",
+};
+
+const INTAKE_OPENING =
+  "Hi! Thanks for reaching out to CORE Product 🌾\n" +
+  "We help farm operators cut energy costs on agricultural pumps.\n\n" +
+  "To see if we're a good fit, reply:\n" +
+  "A — Answer a few quick questions\n" +
+  "B — Upload your utility bills";
+
+const INTAKE_QUESTIONS = [
+  { key: "name",           prompt: "Q1: What is your full name?" },
+  { key: "email",          prompt: "Q2: What is your email address?" },
+  { key: "address",        prompt: "Q3: What is your farm address? (Street, City, Zip)" },
+  { key: "yearlyBill",     prompt: "Q4: What is your estimated yearly utility bill? (e.g. $12,000)" },
+  { key: "rateSchedule",   prompt: "Q5: What is your current rate schedule? (e.g. Ag-C)" },
+  { key: "crop",           prompt: "Q6: What type of crop do you farm? (e.g. Almonds, Walnuts)" },
+  { key: "wateringMonths", prompt: "Q7: How many months per year do you water? (1–9 only)" },
+  { key: "wateringCycle",  prompt: "Q8: What is your typical watering cycle? (e.g. 24 hours on, 48 hours off)" },
+];
+
+// ── Twilio helpers ────────────────────────────────────────────────────────────
+
+function verifyTwilioSignature(req) {
+  const { authToken } = INTAKE_CFG;
+  if (!authToken) return true; // dev: skip if unconfigured
+  const signature = req.headers["x-twilio-signature"] || "";
+  const domain = process.env.RAILWAY_PUBLIC_DOMAIN;
+  const webhookUrl = domain
+    ? `https://${domain}/hooks/whatsapp/intake`
+    : `http://localhost:${process.env.PORT || 8080}/hooks/whatsapp/intake`;
+  const params = req.body || {};
+  const sortedKeys = Object.keys(params).sort();
+  let toSign = webhookUrl;
+  for (const k of sortedKeys) toSign += k + (params[k] ?? "");
+  const expected = crypto.createHmac("sha1", authToken).update(Buffer.from(toSign, "utf-8")).digest("base64");
+  try {
+    return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+  } catch {
+    return false;
+  }
+}
+
+async function twilioSend(to, body) {
+  const { accountSid, authToken, fromNumber } = INTAKE_CFG;
+  if (!accountSid || !authToken || !fromNumber) {
+    log.error("intake", "Twilio credentials missing — cannot send");
+    return;
+  }
+  const url = `https://api.twilio.com/2010-04-01/Accounts/${accountSid}/Messages.json`;
+  const creds = Buffer.from(`${accountSid}:${authToken}`).toString("base64");
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { Authorization: `Basic ${creds}`, "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ From: `whatsapp:${fromNumber}`, To: `whatsapp:${to}`, Body: body }).toString(),
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    log.error("intake", `twilioSend ${res.status}: ${txt}`);
+  }
+}
+
+async function downloadTwilioMedia(mediaUrl) {
+  const { accountSid, authToken } = INTAKE_CFG;
+  const creds = Buffer.from(`${accountSid}:${authToken}`).toString("base64");
+  const res = await fetch(mediaUrl, { headers: { Authorization: `Basic ${creds}` } });
+  if (!res.ok) throw new Error(`media download ${res.status}`);
+  const buf = await res.arrayBuffer();
+  return {
+    data: Buffer.from(buf).toString("base64"),
+    contentType: res.headers.get("content-type") || "image/jpeg",
+  };
+}
+
+// ── Airtable helpers ──────────────────────────────────────────────────────────
+
+async function atRequest(method, path, body) {
+  const url = `https://api.airtable.com/v0${path}`;
+  const opts = {
+    method,
+    headers: { Authorization: `Bearer ${INTAKE_CFG.airtableKey}`, "Content-Type": "application/json" },
+  };
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch(url, opts);
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(`Airtable ${method} ${path} → ${res.status}: ${txt}`);
+  }
+  return res.json();
+}
+
+async function getSession(phone) {
+  const { airtableBase, sessionsTable } = INTAKE_CFG;
+  const formula = encodeURIComponent(`{Phone}="${phone}"`);
+  const data = await atRequest("GET", `/${airtableBase}/${encodeURIComponent(sessionsTable)}?filterByFormula=${formula}&maxRecords=1`);
+  return data.records?.[0] || null;
+}
+
+async function createSession(phone, state) {
+  const { airtableBase, sessionsTable } = INTAKE_CFG;
+  const now = new Date().toISOString();
+  return atRequest("POST", `/${airtableBase}/${encodeURIComponent(sessionsTable)}`, {
+    fields: { Phone: phone, State: state, Answers: "{}", Bills: "[]", BillCount: 0, CreatedAt: now, UpdatedAt: now },
+  });
+}
+
+async function updateSession(recordId, fields) {
+  const { airtableBase, sessionsTable } = INTAKE_CFG;
+  return atRequest("PATCH", `/${airtableBase}/${encodeURIComponent(sessionsTable)}/${recordId}`, {
+    fields: { ...fields, UpdatedAt: new Date().toISOString() },
+  });
+}
+
+async function createLead(fields) {
+  const { airtableBase, leadsTable } = INTAKE_CFG;
+  return atRequest("POST", `/${airtableBase}/${encodeURIComponent(leadsTable)}`, {
+    fields: { ...fields, CreatedAt: new Date().toISOString() },
+  });
+}
+
+// ── Claude vision — bill OCR ──────────────────────────────────────────────────
+
+async function ocrBillImage(base64Data, contentType) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "x-api-key": INTAKE_CFG.anthropicKey,
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "claude-haiku-4-5",
+      max_tokens: 512,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "image", source: { type: "base64", media_type: contentType, data: base64Data } },
+          { type: "text", text: `Extract summary billing data from this utility bill.
+Return ONLY a JSON object:
+{"name":"account holder","said":"service account ID","rate":"rate schedule","kwh":number,"cost":number,"billingPeriod":"e.g. Jan 2025"}
+If this is a chart, graph, or interval-usage detail page (not a billing summary), return {"skip":true}.
+Return only valid JSON, no explanation.` },
+        ],
+      }],
+    }),
+  });
+  if (!res.ok) throw new Error(`Claude OCR ${res.status}`);
+  const data = await res.json();
+  const text = (data.content?.[0]?.text || "").trim();
+  try {
+    const match = text.match(/\{[\s\S]*\}/);
+    return match ? JSON.parse(match[0]) : { skip: true };
+  } catch {
+    return { skip: true };
+  }
+}
+
+// ── State machine ─────────────────────────────────────────────────────────────
+
+async function handleIntakeMessage({ phone, body, mediaUrl, mediaContentType }) {
+  let session = await getSession(phone);
+
+  // ── New farmer ──────────────────────────────────────────────────────────
+  if (!session) {
+    await createSession(phone, "AWAITING_BRANCH");
+    return INTAKE_OPENING;
+  }
+
+  const { State: state, Answers: rawAnswers, Bills: rawBills } = session.fields;
+  const recordId = session.id;
+  const answers = JSON.parse(rawAnswers || "{}");
+  const bills   = JSON.parse(rawBills   || "[]");
+  const input      = (body || "").trim();
+  const inputUpper = input.toUpperCase();
+
+  // ── AWAITING_BRANCH ─────────────────────────────────────────────────────
+  if (state === "AWAITING_BRANCH") {
+    if (inputUpper === "A") {
+      await updateSession(recordId, { State: "A_Q1", Branch: "A" });
+      return `Great! Let's get you set up.\n\n${INTAKE_QUESTIONS[0].prompt}`;
+    }
+    if (inputUpper === "B") {
+      await updateSession(recordId, { State: "B_COLLECTING", Branch: "B" });
+      return "Please send your utility bill photos one at a time.\nReply DONE when you've sent them all. 📄";
+    }
+    return `Please reply:\nA — Answer quick questions\nB — Upload utility bills`;
+  }
+
+  // ── BRANCH A: Q&A loop ──────────────────────────────────────────────────
+  if (state.startsWith("A_Q")) {
+    const qIndex = parseInt(state.replace("A_Q", ""), 10) - 1;
+    const current = INTAKE_QUESTIONS[qIndex];
+
+    if (!input) return current.prompt;
+
+    // Validate watering months
+    if (current.key === "wateringMonths") {
+      const n = parseInt(input, 10);
+      if (isNaN(n) || n < 1 || n > 9) {
+        return "Please enter a number between 1 and 9 for watering months.";
+      }
+    }
+
+    answers[current.key] = input;
+    const nextIndex = qIndex + 1;
+
+    if (nextIndex >= INTAKE_QUESTIONS.length) {
+      // All done — write lead
+      await updateSession(recordId, { State: "A_COMPLETE", Answers: JSON.stringify(answers) });
+      try {
+        await createLead({
+          Name:           answers.name,
+          Phone:          phone,
+          Email:          answers.email,
+          Address:        answers.address,
+          YearlyBill:     answers.yearlyBill,
+          RateSchedule:   answers.rateSchedule,
+          Crop:           answers.crop,
+          WateringMonths: answers.wateringMonths,
+          WateringCycle:  answers.wateringCycle,
+          IntakeMethod:   "Branch A",
+          HasFullYear:    false,
+        });
+        log.info("intake", `lead created (Branch A) phone=${phone}`);
+      } catch (err) {
+        log.error("intake", `createLead failed: ${err.message}`);
+      }
+      const firstName = (answers.name || "").split(" ")[0] || "there";
+      return `Thank you ${firstName}! 🎉\nOur team will reach out soon with your energy optimization proposal.`;
+    }
+
+    // Advance
+    await updateSession(recordId, { State: `A_Q${nextIndex + 1}`, Answers: JSON.stringify(answers) });
+    return INTAKE_QUESTIONS[nextIndex].prompt;
+  }
+
+  // ── BRANCH B: Bill collection ───────────────────────────────────────────
+  if (state === "B_COLLECTING") {
+    if (inputUpper === "DONE") {
+      const count = bills.length;
+      const hasFullYear = count >= 12;
+      await updateSession(recordId, { State: "B_COMPLETE" });
+      try {
+        await createLead({
+          Name:         bills.find(b => b.name)?.name || phone,
+          Phone:        phone,
+          IntakeMethod: "Branch B",
+          BillsData:    JSON.stringify(bills),
+          BillMonths:   count,
+          HasFullYear:  hasFullYear,
+        });
+        log.info("intake", `lead created (Branch B) phone=${phone} bills=${count}`);
+      } catch (err) {
+        log.error("intake", `createLead (B) failed: ${err.message}`);
+      }
+      const flag = hasFullYear ? "" : "\n⚠️ Less than 12 months received — our team may follow up.";
+      return `Got it! We received ${count} month${count === 1 ? "" : "s"} of billing data.${flag}\n\nOur team will be in touch soon! 🌾`;
+    }
+
+    if (mediaUrl) {
+      let extracted = null;
+      try {
+        const media = await downloadTwilioMedia(mediaUrl);
+        extracted = await ocrBillImage(media.data, media.contentType);
+      } catch (err) {
+        log.error("intake", `OCR error: ${err.message}`);
+      }
+
+      if (!extracted || extracted.skip) {
+        return "That page looks like a usage chart — skipping it.\nSend the next page or reply DONE when finished.";
+      }
+
+      bills.push(extracted);
+      await updateSession(recordId, { Bills: JSON.stringify(bills), BillCount: bills.length });
+      const period = extracted.billingPeriod || "page";
+      const kwh    = extracted.kwh ? ` · ${extracted.kwh.toLocaleString()} kWh` : "";
+      return `✅ ${period}${kwh} captured.\n\nSend the next page or reply DONE when finished.`;
+    }
+
+    return "Please send a bill photo, or reply DONE when finished.";
+  }
+
+  // ── Already complete ────────────────────────────────────────────────────
+  if (state === "A_COMPLETE" || state === "B_COMPLETE") {
+    return "We already have your info! Our team will be in touch soon. 🌾";
+  }
+
+  // ── Fallback ────────────────────────────────────────────────────────────
+  log.warn("intake", `unknown state=${state} phone=${phone}`);
+  return "Hi! Reply A to answer questions or B to upload your utility bills.";
+}
+
+// ── Express route — POST /hooks/whatsapp/intake ───────────────────────────────
+
+app.post(
+  "/hooks/whatsapp/intake",
+  express.urlencoded({ extended: false }),
+  async (req, res) => {
+    // Respond immediately — Twilio requires fast 200, we send reply async
+    res.status(200).set("Content-Type", "text/xml").send("<Response/>");
+
+    try {
+      if (!verifyTwilioSignature(req)) {
+        log.warn("intake", "rejected — invalid Twilio signature");
+        return;
+      }
+
+      const from             = (req.body.From || "").replace(/^whatsapp:/, "");
+      const body             = req.body.Body             || "";
+      const mediaUrl         = req.body.MediaUrl0        || null;
+      const mediaContentType = req.body.MediaContentType0|| null;
+
+      if (!from) { log.warn("intake", "missing From"); return; }
+
+      log.info("intake", `inbound from=${from} body="${body.slice(0, 40)}"`);
+
+      const reply = await handleIntakeMessage({ phone: from, body, mediaUrl, mediaContentType });
+      if (reply) {
+        await twilioSend(from, reply);
+        log.info("intake", `sent to ${from}: "${reply.slice(0, 60)}..."`);
+      }
+    } catch (err) {
+      log.error("intake", `unhandled error: ${err.message}`);
+    }
+  }
+);
+
+// ── END CORE PRODUCT INTAKE ───────────────────────────────────────────────────
 const PORT = Number.parseInt(process.env.PORT ?? "8080", 10);
 const STATE_DIR =
   process.env.OPENCLAW_STATE_DIR?.trim() ||
