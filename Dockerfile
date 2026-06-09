@@ -1,5 +1,10 @@
 FROM node:24-bookworm
 
+ARG HTTP_PROXY=
+ARG HTTPS_PROXY=
+ARG http_proxy=
+ARG https_proxy=
+
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates \
