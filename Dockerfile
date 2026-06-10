@@ -4,6 +4,10 @@ ARG HTTP_PROXY=
 ARG HTTPS_PROXY=
 ARG http_proxy=
 ARG https_proxy=
+ENV HTTP_PROXY=""
+ENV HTTPS_PROXY=""
+ENV http_proxy=""
+ENV https_proxy=""
 
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
