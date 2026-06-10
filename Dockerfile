@@ -1,14 +1,7 @@
 FROM node:24-bookworm
 
-ARG HTTP_PROXY=
-ARG HTTPS_PROXY=
-ARG http_proxy=
-ARG https_proxy=
-
-ENV HTTP_PROXY=""
-ENV HTTPS_PROXY=""
-ENV http_proxy=""
-ENV https_proxy=""
+# Clear proxy build args so apt-get can reach Debian repos directly
+ENV HTTP_PROXY="" HTTPS_PROXY="" http_proxy="" https_proxy="" NO_PROXY="" no_proxy=""
 
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
