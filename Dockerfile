@@ -3,7 +3,8 @@ FROM node:24-bookworm
 # Clear proxy build args so apt-get can reach Debian repos directly
 ENV HTTP_PROXY="" HTTPS_PROXY="" http_proxy="" https_proxy="" NO_PROXY="" no_proxy=""
 
-RUN apt-get update \
+RUN unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy no_proxy NO_PROXY \
+  && apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
@@ -16,7 +17,8 @@ RUN apt-get update \
     tini \
   && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g openclaw@latest clawhub@latest
+RUN unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy no_proxy NO_PROXY \
+  && npm install -g openclaw@latest clawhub@latest
 
 # Backward-compatibility shim for older OPENCLAW_ENTRY values.
 RUN mkdir -p /openclaw \
@@ -25,7 +27,8 @@ RUN mkdir -p /openclaw \
 WORKDIR /app
 
 COPY package.json pnpm-lock.yaml ./
-RUN npm install -g pnpm@10 && pnpm install --prod
+RUN unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy no_proxy NO_PROXY \
+  && npm install -g pnpm@10 && pnpm install --prod
 
 COPY src ./src
 COPY --chmod=755 entrypoint.sh ./entrypoint.sh
@@ -36,7 +39,8 @@ RUN useradd -m -s /bin/bash openclaw \
   && mkdir -p /home/linuxbrew/.linuxbrew && chown -R openclaw:openclaw /home/linuxbrew
 
 USER openclaw
-RUN NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+RUN unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy no_proxy NO_PROXY \
+  && NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
 ENV PATH="/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:${PATH}"
 ENV HOMEBREW_PREFIX="/home/linuxbrew/.linuxbrew"
